@@ -12,10 +12,12 @@ comfyui-TIL (Text-Inline LoRA)
 
 클립가중치가 생략되면 모델가중치와 동일한 값을 사용한다 (WebUI 관례와 동일).
 
-노드 구성 (3개):
+노드 구성 (6개):
     TIL - Base       : 텍스트 + 모델을 한 노드가 함께 받아 파싱·적용까지 한 번에 처리 (로컬형)
     TIL - Sender      : 텍스트만 파싱해 결과(TIL_LORA_STACK)를 내보냄. model 소켓 없음 (원격 송신측)
     TIL - Receiver     : Sender 가 만든 결과를 받아 model(및 clip)에 실제로 적용 (원격 수신측)
+    TIL - Sender (Wireless) / Receiver (Wireless): 채널 문자열로 결과를 전달하고 적용
+    TIL - LoRA Checker: 모델 또는 LoRA의 블록 구조를 문자열로 출력
 """
 
 import os
@@ -23,11 +25,14 @@ import re
 import json
 import hashlib
 import logging
+import math
 from collections import Counter
 
 import folder_paths
 import comfy.utils
 import comfy.sd
+import comfy.lora
+import comfy.lora_convert
 
 logger = logging.getLogger("TIL")
 
@@ -159,6 +164,17 @@ def lora_has_clip_keys(lora_sd: dict) -> bool:
     return False
 
 
+def _is_clip_lora_key(key: str) -> bool:
+    lk = key.lower()
+    return (
+        "lora_te" in lk
+        or "text_encoder" in lk
+        or "te1_" in lk
+        or "te2_" in lk
+        or lk.startswith("clip_")
+    )
+
+
 def fingerprint_prompt(prompt) -> str | None:
     """
     ComfyUI가 hidden input "PROMPT"로 넘겨주는 워크플로우 그래프 딕셔너리를
@@ -179,13 +195,196 @@ def fingerprint_prompt(prompt) -> str | None:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+# Stable ordering for the common diffusion block naming schemes used by
+# ComfyUI's model state_dict keys and LoRA keys. The checker exposes this
+# ordering as zero-based indices; it does not attempt to describe block roles.
+_BLOCK_FAMILY_ORDER = (
+    "input_blocks",
+    "down_blocks",
+    "double_blocks",
+    "joint_blocks",
+    "transformer_blocks",
+    "blocks",
+    "layers",
+    "middle_block",
+    "mid_block",
+    "single_blocks",
+    "single_transformer_blocks",
+    "output_blocks",
+    "up_blocks",
+)
+_INDEXED_BLOCK_FAMILIES = tuple(
+    family for family in _BLOCK_FAMILY_ORDER
+    if family not in ("middle_block", "mid_block")
+)
+_BLOCK_DOT_PATTERNS = [
+    (family, re.compile(r"(?:^|\.)" + re.escape(family) + r"\.(\d+)(?:\.|$)"))
+    for family in _INDEXED_BLOCK_FAMILIES
+]
+_BLOCK_UNDERSCORE_PATTERNS = [
+    (family, re.compile(r"(?:^|_)" + re.escape(family) + r"_(\d+)(?:_|$)"))
+    for family in _INDEXED_BLOCK_FAMILIES
+]
+
+
+def _block_descriptor(key: str) -> tuple[str, int | None] | None:
+    """Return the architecture-local block family/index represented by a key."""
+    for family in ("middle_block", "mid_block"):
+        if re.search(r"(?:^|\.)" + family + r"(?:\.|$)", key):
+            return (family, None)
+
+    for patterns in (_BLOCK_DOT_PATTERNS, _BLOCK_UNDERSCORE_PATTERNS):
+        for family, pattern in patterns:
+            match = pattern.search(key)
+            if match:
+                return (family, int(match.group(1)))
+    return None
+
+
+def _ordered_block_map(keys) -> dict[tuple[str, int | None], int]:
+    """Map discovered block groups to stable zero-based display indices."""
+    found = set()
+    for key in keys:
+        descriptor = _block_descriptor(str(key))
+        if descriptor is not None:
+            found.add(descriptor)
+
+    order = {family: i for i, family in enumerate(_BLOCK_FAMILY_ORDER)}
+    return {
+        descriptor: index
+        for index, descriptor in enumerate(
+            sorted(found, key=lambda item: (order[item[0]], -1 if item[1] is None else item[1]))
+        )
+    }
+
+
+def _describe_block(descriptor: tuple[str, int | None]) -> str:
+    family, block_number = descriptor
+    return family if block_number is None else f"{family}.{block_number}"
+
+
+def _target_key(value) -> str | None:
+    """Extract the model key from a ComfyUI LoRA key-map value."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (tuple, list)) and value and isinstance(value[0], str):
+        return value[0]
+    return None
+
+
+def _target_keys(key_map: dict) -> set[str]:
+    return {key for key in (_target_key(value) for value in key_map.values()) if key}
+
+
+def _block_warning(message: str):
+    """Block validation warnings are always visible, independent of the success-log toggle."""
+    print(message)
+    logger.warning(message)
+
+
+def _parse_block_weights(value: str, block_map: dict) -> dict[int, float]:
+    """Parse comma-separated index:strength entries; omitted blocks stay at 1."""
+    result = {}
+    if not value:
+        return result
+    # Whitespace has no meaning in this compact syntax, so normalize it away.
+    value = "".join(value.split())
+    if not value:
+        return result
+
+    for item in value.split(","):
+        if not item:
+            continue
+        if item.count(":") != 1:
+            _block_warning(f"[TIL] 경고: 블록 설정 '{item}' 형식이 잘못되어 무시합니다. (예: 0:0.5)")
+            continue
+
+        block_text, strength_text = item.split(":", 1)
+        if not re.fullmatch(r"\d+", block_text):
+            _block_warning(f"[TIL] 경고: 블록 번호 '{block_text}'가 0 이상의 정수가 아니어서 무시합니다.")
+            continue
+
+        block_index = int(block_text)
+        try:
+            strength = float(strength_text)
+        except (TypeError, ValueError):
+            _block_warning(f"[TIL] 경고: 블록 {block_text}의 강도 '{strength_text}'를 숫자로 읽을 수 없어 무시합니다.")
+            continue
+
+        if not math.isfinite(strength):
+            _block_warning(f"[TIL] 경고: 블록 {block_text}의 강도는 유한한 숫자여야 하므로 무시합니다.")
+            continue
+        if block_index >= len(block_map):
+            _block_warning(f"[TIL] 경고: 블록 {block_index:02d}은 감지된 범위(00-{max(len(block_map) - 1, 0):02d}) 밖이라 무시합니다.")
+            continue
+        if strength < 0:
+            _block_warning(f"[TIL] 경고: 블록 {block_index:02d}의 강도 {strength}는 0으로 제한합니다.")
+            strength = 0.0
+        elif strength > 1:
+            _block_warning(f"[TIL] 경고: 블록 {block_index:02d}의 강도 {strength}는 1로 제한합니다.")
+            strength = 1.0
+
+        if block_index in result:
+            _block_warning(f"[TIL] 경고: 블록 {block_index:02d}이 중복 지정되어 마지막 값을 사용합니다.")
+        result[block_index] = strength
+
+    return result
+
+
+def _load_lora_with_block_weights(model, clip, lora_sd, strength_model, strength_clip, block_map, block_weights):
+    """Load a LoRA and scale model patches by their discovered block index."""
+    model_key_map = {}
+    clip_key_map = {}
+    if model is not None:
+        model_key_map = comfy.lora.model_lora_keys_unet(model.model, model_key_map)
+    if clip is not None:
+        clip_key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, clip_key_map)
+
+    key_map = dict(model_key_map)
+    key_map.update(clip_key_map)
+    converted_lora = comfy.lora_convert.convert_lora(lora_sd)
+    loaded = comfy.lora.load_lora(converted_lora, key_map)
+
+    model_targets = _target_keys(model_key_map)
+    clip_targets = _target_keys(clip_key_map)
+    out_model = model.clone() if model is not None else None
+    out_clip = clip.clone() if clip is not None else None
+
+    model_groups: dict[float, dict] = {}
+    clip_patches = {}
+    for key, patch in loaded.items():
+        if key in model_targets:
+            descriptor = _block_descriptor(key)
+            block_index = block_map.get(descriptor) if descriptor is not None else None
+            block_scale = block_weights.get(block_index, 1.0)
+            model_groups.setdefault(strength_model * block_scale, {})[key] = patch
+        if key in clip_targets:
+            clip_patches[key] = patch
+
+    applied = set()
+    if out_model is not None:
+        for patch_strength, patches in model_groups.items():
+            if patch_strength != 0:
+                applied.update(out_model.add_patches(patches, patch_strength))
+            else:
+                # A zero multiplier intentionally disables these recognized patches.
+                applied.update(patches)
+    if out_clip is not None and clip_patches:
+        applied.update(out_clip.add_patches(clip_patches, strength_clip))
+    for key in loaded:
+        if key not in applied:
+            logger.warning("[TIL] NOT LOADED: %s", key)
+
+    return out_model, out_clip
+
+
 def log_msg(enabled: bool, message: str):
     if enabled:
         print(message)
     logger.info(message)
 
 
-def apply_tags(model, clip, tags: list[dict], mode: str, log: bool):
+def apply_tags(model, clip, tags: list[dict], mode: str, log: bool, block_weights: str = ""):
     """
     파싱된 태그 목록을 등장 순서대로 model(및 필요 시 clip)에 순차 적용한다.
     mode: "auto" | "clip" | "no_clip"
@@ -195,6 +394,23 @@ def apply_tags(model, clip, tags: list[dict], mode: str, log: bool):
 
     out_model = model
     out_clip = clip
+
+    block_map = {}
+    parsed_block_weights = {}
+    if block_weights and block_weights.strip():
+        detection_error = None
+        try:
+            model_key_map = comfy.lora.model_lora_keys_unet(model.model, {})
+            block_map = _ordered_block_map(_target_keys(model_key_map))
+        except Exception as e:
+            detection_error = e
+        if not block_map:
+            if detection_error is None:
+                _block_warning("[TIL] 경고: 모델 블록 구조를 감지하지 못해 블록 설정을 적용할 수 없습니다.")
+            else:
+                _block_warning(f"[TIL] 경고: 모델 블록 정보를 읽지 못해 블록 설정을 적용할 수 없습니다. ({detection_error})")
+        else:
+            parsed_block_weights = _parse_block_weights(block_weights, block_map)
 
     name_counts = Counter(tag["name"] for tag in tags)
     for dup_name, count in name_counts.items():
@@ -241,7 +457,20 @@ def apply_tags(model, clip, tags: list[dict], mode: str, log: bool):
             use_clip = False
 
         try:
-            if use_clip:
+            if parsed_block_weights:
+                new_model, new_clip = _load_lora_with_block_weights(
+                    out_model,
+                    out_clip if use_clip else None,
+                    lora_sd,
+                    w_model,
+                    w_clip,
+                    block_map,
+                    parsed_block_weights,
+                )
+                out_model = new_model
+                if use_clip:
+                    out_clip = new_clip
+            elif use_clip:
                 new_model, new_clip = comfy.sd.load_lora_for_models(
                     out_model, out_clip, lora_sd, w_model, w_clip
                 )
@@ -289,6 +518,14 @@ class TIL_Base:
                 ),
                 "mode": (["auto", "clip", "no_clip"], {"default": "auto"}),
                 "log": ("BOOLEAN", {"default": True}),
+                "block_weights": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "블록별 강도. 예: 0:0.5, 2:0, 15:0.15 (미지정 블록은 1)",
+                    },
+                ),
             },
             "optional": {
                 "clip": ("CLIP",),
@@ -300,9 +537,9 @@ class TIL_Base:
     FUNCTION = "run"
     CATEGORY = "TIL"
 
-    def run(self, model, text, mode, log, clip=None):
+    def run(self, model, text, mode, log, block_weights, clip=None):
         tags = parse_tags(text, log=log)
-        out_model, out_clip = apply_tags(model, clip, tags, mode, log)
+        out_model, out_clip = apply_tags(model, clip, tags, mode, log, block_weights)
         cleaned = clean_text(text)
         return (out_model, out_clip, cleaned)
 
@@ -364,6 +601,14 @@ class TIL_Receiver:
                 "lora_stack": ("TIL_LORA_STACK",),
                 "mode": (["auto", "clip", "no_clip"], {"default": "auto"}),
                 "log": ("BOOLEAN", {"default": True}),
+                "block_weights": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "블록별 강도. 예: 0:0.5, 2:0, 15:0.15 (미지정 블록은 1)",
+                    },
+                ),
             },
             "optional": {
                 "clip": ("CLIP",),
@@ -375,8 +620,8 @@ class TIL_Receiver:
     FUNCTION = "run"
     CATEGORY = "TIL"
 
-    def run(self, model, lora_stack, mode, log, clip=None):
-        out_model, out_clip = apply_tags(model, clip, lora_stack, mode, log)
+    def run(self, model, lora_stack, mode, log, block_weights, clip=None):
+        out_model, out_clip = apply_tags(model, clip, lora_stack, mode, log, block_weights)
         return (out_model, out_clip)
 
 
@@ -486,6 +731,14 @@ class TIL_Receiver_Wireless:
                 ),
                 "mode": (["auto", "clip", "no_clip"], {"default": "auto"}),
                 "log": ("BOOLEAN", {"default": True}),
+                "block_weights": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "블록별 강도. 예: 0:0.5, 2:0, 15:0.15 (미지정 블록은 1)",
+                    },
+                ),
             },
             "optional": {
                 "clip": ("CLIP",),
@@ -501,12 +754,12 @@ class TIL_Receiver_Wireless:
     CATEGORY = "TIL"
 
     @classmethod
-    def IS_CHANGED(cls, model, channel, mode, log, clip=None, prompt=None):
+    def IS_CHANGED(cls, model, channel, mode, log, block_weights, clip=None, prompt=None):
         # 항상 재실행되도록 강제한다. 안 그러면 ComfyUI가 입력이 그대로일 때
         # 함수를 스킵해버려서, 채널 값이 바뀌어도 반영되지 않는다.
         return float("nan")
 
-    def run(self, model, channel, mode, log, clip=None, prompt=None):
+    def run(self, model, channel, mode, log, block_weights, clip=None, prompt=None):
         entry = _WIRELESS_STORE.get(channel)
 
         if entry is None:
@@ -544,8 +797,150 @@ class TIL_Receiver_Wireless:
             )
 
         tags = entry.get("tags", [])
-        out_model, out_clip = apply_tags(model, clip, tags, mode, log)
+        out_model, out_clip = apply_tags(model, clip, tags, mode, log, block_weights)
         return (out_model, out_clip)
+
+
+class TIL_LoRA_Checker:
+    """Report detected model/LoRA block counts and the checker-assigned indices."""
+
+    NO_LORA = "(모델만 검사)"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        lora_choices = [cls.NO_LORA] + folder_paths.get_filename_list("loras")
+        return {
+            "required": {
+                "lora_name": (lora_choices, {"default": cls.NO_LORA}),
+            },
+            "optional": {
+                "model": ("MODEL",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("report",)
+    FUNCTION = "inspect"
+    CATEGORY = "TIL"
+
+    def inspect(self, lora_name, model=None):
+        lines = ["TIL LoRA / Model Block Check"]
+        model_key_map = {}
+        model_block_map = {}
+
+        if model is not None:
+            try:
+                model_key_map = comfy.lora.model_lora_keys_unet(model.model, {})
+                model_block_map = _ordered_block_map(_target_keys(model_key_map))
+                model_type = type(model.model).__name__
+                model_config = getattr(model.model, "model_config", None)
+                config_name = type(model_config).__name__ if model_config is not None else "unknown config"
+                lines.append(f"Model type: {model_type} ({config_name})")
+                lines.append(f"Mapped model keys: {len(_target_keys(model_key_map))}")
+                lines.append(f"Model block groups detected: {len(model_block_map)}")
+                if model_block_map:
+                    model_keys_by_block = {index: [] for index in model_block_map.values()}
+                    for key in _target_keys(model_key_map):
+                        descriptor = _block_descriptor(key)
+                        if descriptor in model_block_map:
+                            model_keys_by_block[model_block_map[descriptor]].append(key)
+                    for descriptor, index in sorted(model_block_map.items(), key=lambda item: item[1]):
+                        keys = model_keys_by_block[index]
+                        lines.append(f"  {index:02d}: {_describe_block(descriptor)} ({len(keys)} mapped model keys)")
+                        for key in sorted(keys)[:3]:
+                            lines.append(f"      {key}")
+                        if len(keys) > 3:
+                            lines.append(f"      ... and {len(keys) - 3} more")
+                else:
+                    lines.append("  No supported block naming pattern was detected in the model.")
+            except Exception as e:
+                lines.append(f"Model inspection failed: {e}")
+        else:
+            lines.append("Model: not connected")
+
+        if lora_name != self.NO_LORA:
+            try:
+                lora_path = folder_paths.get_full_path("loras", lora_name)
+                if lora_path is None:
+                    lines.append(f"LoRA: file path not found for '{lora_name}'")
+                else:
+                    lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                    lines.append(f"LoRA: {lora_name}")
+                    lines.append(f"Path: {lora_path}")
+                    lines.append(f"LoRA tensor keys: {len(lora_sd)}")
+                    clip_lora_keys = [key for key in lora_sd if _is_clip_lora_key(str(key))]
+                    lines.append(f"CLIP / text-encoder keys (not model blocks): {len(clip_lora_keys)}")
+                    tensor_values = [value for value in lora_sd.values() if hasattr(value, "numel")]
+                    total_params = sum(int(value.numel()) for value in tensor_values)
+                    dtype_counts = Counter(str(value.dtype) for value in tensor_values)
+                    lines.append(f"Tensor entries: {len(tensor_values)}; total parameters: {total_params:,}")
+                    if dtype_counts:
+                        lines.append("Dtypes: " + ", ".join(f"{dtype} ({count})" for dtype, count in sorted(dtype_counts.items())))
+
+                    if model is not None and model_key_map:
+                        converted_lora = comfy.lora_convert.convert_lora(lora_sd)
+                        mapped_lora = comfy.lora.load_lora(converted_lora, model_key_map)
+                        mapped_by_block = {index: [] for index in model_block_map.values()}
+                        for key in mapped_lora:
+                            descriptor = _block_descriptor(key)
+                            if descriptor in model_block_map:
+                                mapped_by_block[model_block_map[descriptor]].append(key)
+                        covered = {index for index, keys in mapped_by_block.items() if keys}
+                        lines.append(
+                            f"LoRA blocks matched to this model: {len(covered)} / {len(model_block_map)}"
+                        )
+                        lines.append(
+                            "  Matched indices: "
+                            + (", ".join(f"{index:02d}" for index in sorted(covered)) or "none")
+                        )
+                        for index in sorted(covered):
+                            keys = sorted(mapped_by_block[index])
+                            lines.append(f"  {index:02d}: {len(keys)} mapped LoRA patch keys")
+                            for key in keys[:3]:
+                                lines.append(f"      {key}")
+                            if len(keys) > 3:
+                                lines.append(f"      ... and {len(keys) - 3} more")
+                    else:
+                        model_lora_keys = [
+                            key for key in lora_sd if not _is_clip_lora_key(str(key))
+                        ]
+                        lora_block_map = _ordered_block_map(model_lora_keys)
+                        lines.append(
+                            f"LoRA block groups estimated from keys: {len(lora_block_map)}"
+                        )
+                        if model is None:
+                            lines.append(
+                                "  No model connected; LoRA-only block numbering is an estimate and may differ from the full model."
+                            )
+                        if lora_block_map:
+                            for descriptor, index in sorted(lora_block_map.items(), key=lambda item: item[1]):
+                                group_keys = [
+                                    key for key in model_lora_keys
+                                    if _block_descriptor(str(key)) == descriptor
+                                ]
+                                group_params = sum(
+                                    int(lora_sd[key].numel())
+                                    for key in group_keys
+                                    if hasattr(lora_sd[key], "numel")
+                                )
+                                lines.append(
+                                    f"  {index:02d}: {_describe_block(descriptor)} "
+                                    f"({len(group_keys)} tensor keys, {group_params:,} parameters)"
+                                )
+                                for key in sorted(group_keys)[:3]:
+                                    value = lora_sd[key]
+                                    shape = tuple(value.shape) if hasattr(value, "shape") else "unknown"
+                                    lines.append(f"      {key} shape={shape}")
+                                if len(group_keys) > 3:
+                                    lines.append(f"      ... and {len(group_keys) - 3} more")
+                        else:
+                            lines.append("  No supported block naming pattern was detected in the LoRA keys.")
+            except Exception as e:
+                lines.append(f"LoRA inspection failed for '{lora_name}': {e}")
+        elif model is None:
+            lines.append("Connect a model or select a LoRA to inspect.")
+
+        return ("\n".join(lines),)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -554,6 +949,7 @@ NODE_CLASS_MAPPINGS = {
     "TIL_Receiver": TIL_Receiver,
     "TIL_Sender_Wireless": TIL_Sender_Wireless,
     "TIL_Receiver_Wireless": TIL_Receiver_Wireless,
+    "TIL_LoRA_Checker": TIL_LoRA_Checker,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -562,4 +958,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TIL_Receiver": "TIL - Receiver",
     "TIL_Sender_Wireless": "TIL - Sender (Wireless)",
     "TIL_Receiver_Wireless": "TIL - Receiver (Wireless)",
+    "TIL_LoRA_Checker": "TIL - LoRA Checker",
 }

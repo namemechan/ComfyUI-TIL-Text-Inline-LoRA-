@@ -27,17 +27,17 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 
 ---
 
-## 노드 구성 (총 5개)
+## 노드 구성 (총 6개)
 
 이 팩은 **한 노드가 전부 처리하는 방식(Base)**, **선으로 연결해서 입력과 적용 위치를
 떨어뜨리는 방식(Sender → Receiver)**, 그리고 **선 연결 없이 채널 이름으로만 연결하는
 방식(Sender (Wireless) → Receiver (Wireless))** 세 가지 사용법을 제공합니다.
-다섯 노드 모두 내부적으로 같은 파싱/적용 로직을 공유하므로, 최종 동작 결과는 동일합니다.
+적용 노드들은 내부적으로 같은 파싱/적용 로직을 공유하므로, 최종 동작 결과는 동일합니다.
 
 ### 1. TIL - Base
 가장 단순한 형태. 텍스트와 모델을 한 노드에서 함께 받아, 파싱부터 LoRA 적용까지 한 번에 처리합니다.
 
-- **입력**: `model`, `text`, `mode`, `log`, *(선택)* `clip`
+- **입력**: `model`, `text`, `mode`, `log`, `block_weights`, *(선택)* `clip`
 - **출력**: `model`, `clip`, `text` (태그 제거된 문자열)
 - **언제 쓰나**: 그래프를 간단하게 유지하고 싶을 때, 텍스트 입력 위치와 모델이 가까이 있을 때
 
@@ -51,7 +51,7 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 ### 3. TIL - Receiver
 `TIL - Sender`가 만든 `lora_stack`을 받아 실제로 LoRA 파일을 로드하고 모델에 적용합니다.
 
-- **입력**: `model`, `lora_stack`, `mode`, `log`, *(선택)* `clip`
+- **입력**: `model`, `lora_stack`, `mode`, `log`, `block_weights`, *(선택)* `clip`
 - **출력**: `model`, `clip`
 - **언제 쓰나**: 체크포인트 로더 근처 등 모델이 실제로 흐르는 지점에 배치
 
@@ -71,7 +71,7 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 같은 `channel` 이름의 `TIL - Sender (Wireless)`가 저장한 파싱 결과를 가져와 실제로 LoRA
 파일을 로드하고 모델에 적용합니다.
 
-- **입력**: `model`, `channel`, `mode`, `log`, *(선택)* `clip`
+- **입력**: `model`, `channel`, `mode`, `log`, `block_weights`, *(선택)* `clip`
 - **출력**: `model`, `clip`
 - **언제 쓰나**: `TIL - Sender (Wireless)`와 짝을 이루어 쓸 때
 
@@ -87,6 +87,13 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 > - 두 Wireless 노드는 매 실행마다 강제로 다시 돌도록 설정되어 있어(`IS_CHANGED`), 입력이
 >   그대로여도 채널 값이 갱신됩니다.
 
+### 6. TIL - LoRA Checker
+모델을 연결하거나 LoRA 파일을 선택해 블록 정보를 문자열로 출력합니다. 모델과 LoRA를 함께 지정하면 해당 LoRA가 그 모델의 어느 블록에 매칭되는지도 확인할 수 있습니다. LoRA만 지정한 경우에는 LoRA 키를 바탕으로 블록 그룹을 추정합니다.
+
+- **입력**: `lora_name` (선택 목록, 기본값은 모델만 검사), *(선택)* `model`
+- **출력**: `report` (블록 수, 0부터 시작하는 번호와 감지된 블록 키)
+- **주의**: 번호는 감지된 블록의 순서이며 블록의 역할을 설명하지 않습니다. 역할 해석은 사용자가 모델 구조에 따라 확인합니다.
+
 ---
 
 ## 공통 옵션
@@ -96,6 +103,9 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 | `mode` | `auto` / `clip` / `no_clip` | `auto`는 LoRA 파일 내부 키를 검사해 CLIP 가중치 포함 여부를 자동 판단합니다. `clip`은 강제로 CLIP까지 적용, `no_clip`은 모델에만 적용합니다. |
 | `log` | `True` / `False` | 적용 성공/실패 로그를 콘솔에 출력할지 여부 |
 | `channel` | 문자열 (기본값 `"TIL"`) | Wireless 노드 전용. 같은 이름의 Sender (Wireless) ↔ Receiver (Wireless)를 연결하는 식별자 |
+| `block_weights` | `블록번호:강도` 목록 | Base와 Receiver 노드에서 모델 블록별 강도를 지정합니다. 쉼표로 여러 항목을 구분합니다. |
+
+예: `0:0.5, 2:0, 15:0.15`는 0번 블록을 절반 강도로, 2번 블록을 끄고, 15번 블록을 0.15 강도로 적용합니다. `00`과 `0`, `01`과 `1`은 같은 번호로 취급합니다. 입력의 공백 문자는 모두 제거한 뒤 파싱하므로 쉼표·콜론 앞뒤뿐 아니라 숫자 사이의 공백도 무시됩니다. 지정하지 않은 블록은 기본 강도 `1`을 사용합니다. 강도는 `0`에서 `1` 사이로 제한되며, 범위를 벗어난 값은 경고를 출력한 뒤 제한합니다. 존재하지 않는 번호는 경고 후 무시합니다. 이 설정은 모델 블록에만 적용되고 CLIP 강도에는 영향을 주지 않습니다.
 
 - `mode`가 `clip` 또는 `auto`(CLIP 키 포함 판단)이지만 `clip` 입력이 연결되어 있지 않으면,
   경고 로그를 남기고 모델에만 적용합니다.
@@ -108,7 +118,7 @@ best quality, 1girl, <lora:my_lora:0.8>, solo
 ```
 comfyui-til/
 ├── __init__.py      # 노드 매핑 export
-└── til_nodes.py      # 태그 파싱/적용 로직 + 노드 3개 정의 (단일 파일 통합)
+└── til_nodes.py      # 태그 파싱/적용 로직 + 노드 정의 (단일 파일 통합)
 ```
 
 ---
